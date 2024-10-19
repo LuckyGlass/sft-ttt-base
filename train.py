@@ -132,19 +132,26 @@ class SupervisedDataset(Dataset):
         logging.warning("Loading data...")
         list_data_dict = utils.jload(data_path)
 
-        logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
-        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
-
-        logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
-
-        self.input_ids = data_dict["input_ids"]
-        self.labels = data_dict["labels"]
+        logging.warning("Formatting and tokenizing inputs...")
+        # Formatting for Bamboo-style timeline-reorder and tokenizing
+        self.input_ids = []
+        self.labels = []
+        for example in list_data_dict:
+            prompts = [
+                "Please summary the event described in the following piece of texts in one sentence.",
+                f"The piece of texts is: {example['input']}",
+                "Please summary the event described in the piece of texts in one sentence. Please do not output anything else."
+            ]
+            messages = [
+                {'role': 'system', 'content': "You are a helpful assistant."},
+                {'role': 'user', 'content': '\n'.join(prompts)},
+                {'role': 'assistant', 'content': ' < '.join(f'[{i}]' for i in example['answers'])}
+            ]
+            input_ids = tokenizer.apply_chat_template(messages[:-1], return_tensors='pt', add_generation_prompt=True, return_dict=True)['input_ids'].flatten()
+            labels = tokenizer.apply_chat_template(messages, return_tensors='pt', add_generation_prompt=False, return_dict=True)['input_ids'].flatten()
+            labels[:input_ids.shape[-1]] = IGNORE_INDEX
+            self.input_ids.append(input_ids)
+            self.labels.append(labels)
 
     def __len__(self):
         return len(self.input_ids)
