@@ -1,3 +1,8 @@
+# Custom
+data/
+models/
+utils.sh
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
