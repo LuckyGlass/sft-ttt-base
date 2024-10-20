@@ -254,8 +254,8 @@ def train():
             bias="none",
             task_type="CAUSAL_LM"
         )
-        model = get_peft_model(model, lora_config)
         model = prepare_model_for_kbit_training(model)
+        model = get_peft_model(model, lora_config)
         print(model)
         model.print_trainable_parameters()
 
