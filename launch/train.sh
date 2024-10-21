@@ -11,7 +11,7 @@
 
 torchrun --nproc_per_node=4 --master_port=$RANDOM train.py \
     --model_name_or_path models/Meta-Llama-3-8B-Instruct \
-    --data_path data/timeline-dev.json \
+    --data_path data/timeline-train.json \
     --len_segment 8 \
     --len_offset 3 \
     --block_size 256 \
