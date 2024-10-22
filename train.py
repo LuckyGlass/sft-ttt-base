@@ -14,8 +14,9 @@
 
 import copy
 import logging
+import tqdm
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, List
 
 import torch
 import transformers
@@ -50,7 +51,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_paths: List[str] = field(default_factory=lambda: [], metadata={"help": "Path to the training data."})
     len_segment: int = field(default=2)
     len_offset: int = field(default=1)
     block_size: int = field(default=1024)
@@ -135,10 +136,10 @@ def preprocess(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, len_segment: int, len_offset: int, block_size: int, model_max_length: int):
+    def __init__(self, data_paths: List[str], tokenizer: transformers.PreTrainedTokenizer, len_segment: int, len_offset: int, block_size: int, model_max_length: int):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        list_data_dict = utils.jload(data_path)
+        list_data_dict = sum((utils.jload(one_file_path) for one_file_path in data_paths), start=[])
 
         logging.warning("Formatting and tokenizing inputs...")
         # Formatting for Bamboo-style timeline-reorder and tokenizing
@@ -146,7 +147,7 @@ class SupervisedDataset(Dataset):
         self.labels = []
         len_segment = len_segment * block_size
         len_offset = len_offset * block_size
-        for example in list_data_dict:
+        for example in tqdm.tqdm(list_data_dict, desc="Tokenize"):
             context_ids = tokenizer(example['input'] + tokenizer.bos_token, add_special_tokens=False, return_tensors='pt').input_ids.flatten()
             self.input_ids += [context_ids[s:s+len_segment] for s in range(0, context_ids.shape[-1], len_offset)]
             self.labels += [context_ids[s:s+len_segment] for s in range(0, context_ids.shape[-1], len_offset)]
@@ -212,7 +213,7 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, model_max_length: int) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, len_segment=data_args.len_segment, len_offset=data_args.len_offset, block_size=data_args.block_size, model_max_length=model_max_length)
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_paths=data_args.data_paths, len_segment=data_args.len_segment, len_offset=data_args.len_offset, block_size=data_args.block_size, model_max_length=model_max_length)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
