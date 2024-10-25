@@ -12,6 +12,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import os
+import wandb
 import copy
 import logging
 import tqdm
@@ -94,45 +96,6 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
-def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
-    """Tokenize a list of strings."""
-    tokenized_list = [
-        tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        )
-        for text in strings
-    ]
-    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
-    input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
-    ]
-    return dict(
-        input_ids=input_ids,
-        labels=labels,
-        input_ids_lens=input_ids_lens,
-        labels_lens=labels_lens,
-    )
-
-
-def preprocess(
-    sources: Sequence[str],
-    targets: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Preprocess the data by tokenizing."""
-    examples = [s + t for s, t in zip(sources, targets)]
-    examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
-    input_ids = examples_tokenized["input_ids"]
-    labels = copy.deepcopy(input_ids)
-    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len] = IGNORE_INDEX
-    return dict(input_ids=input_ids, labels=labels)
-
-
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -148,42 +111,34 @@ class SupervisedDataset(Dataset):
         len_segment = len_segment * block_size
         len_offset = len_offset * block_size
         for example in tqdm.tqdm(list_data_dict, desc="Tokenize"):
-            context_ids = tokenizer(example['input'] + tokenizer.bos_token, add_special_tokens=False, return_tensors='pt').input_ids.flatten()
+            context_ids = tokenizer(example['content'] + tokenizer.bos_token, add_special_tokens=False, return_tensors='pt').input_ids.flatten()
             self.input_ids += [context_ids[s:s+len_segment] for s in range(0, context_ids.shape[-1], len_offset)]
             self.labels += [context_ids[s:s+len_segment] for s in range(0, context_ids.shape[-1], len_offset)]
-            for qa in example['qa_pairs']:
+            if 'qa_pairs' in example:
+                qa_pairs = example['qa_pairs']
+            else:
+                qa_pairs = [example]
+            for qa in qa_pairs:
                 prompts = [
                     "Please sort the given events in the order of their appearance in the following long texts, from first to last.",
-                    example['input'],
+                    example['content'],
                     "Please sort the given events in the order of their appearance in the long texts, from first to last. The given events are:",
                 ]
                 prompts += [f"[{i + 1}]: {summary}" for i, summary in enumerate(qa['summaries'])]
                 prompts += ["For example, a valid answer is [2] < [3] < [1] < [4] < [5]."]
-                messages = [
+                messages_in = [
                     {'role': 'system', 'content': "You are a helpful assistant."},
                     {'role': 'user', 'content': '\n'.join(prompts)},
-                    {'role': 'assistant', 'content': ' < '.join(f'[{i}]' for i in qa['answers'])}
                 ]
-                input_length = tokenizer.apply_chat_template(messages[:-1], return_tensors='pt', add_generation_prompt=True, return_dict=True)['input_ids'].shape[-1]
-                input_ids = tokenizer.apply_chat_template(messages, return_tensors='pt', add_generation_prompt=False, return_dict=True)['input_ids'].flatten()
-                output_length = input_ids.shape[-1] - input_length
-                if input_ids.shape[-1] > model_max_length:
-                    input_ids = torch.concat((input_ids[:model_max_length//2], input_ids[-model_max_length//2:]), dim=-1)
-                    input_length = len(input_ids) - output_length
-                labels = input_ids.clone()
-                labels[:input_length] = IGNORE_INDEX
-
-                assert input_ids.shape[-1] <= model_max_length
-                self.input_ids.append(input_ids)
-                self.labels.append(labels)
-        for i in range(len(self.input_ids)):
-            len_pad = model_max_length - self.input_ids[i].shape[-1]
-            assert len_pad >= 0
-            if len_pad > 0:
-                pad = torch.LongTensor([tokenizer.pad_token_id] * len_pad)
-                self.input_ids[i] = torch.concat((self.input_ids[i], pad), dim=-1)
-                pad = torch.LongTensor([IGNORE_INDEX] * len_pad)
-                self.labels[i] = torch.concat((self.labels[i], pad), dim=-1)
+                response = ' < '.join(f'[{i}]' for i in qa['answer'])
+                input_ids = tokenizer.apply_chat_template(messages_in, return_tensors='pt', add_generation_prompt=True, return_dict=True)['input_ids'].flatten()
+                output_ids = tokenizer(response, return_tensors='pt', add_special_tokens=True).input_ids.flatten()
+                max_input_length = model_max_length - output_ids.shape[-1]
+                if input_ids.shape[-1] > max_input_length:
+                    input_ids = torch.concat((input_ids[:max_input_length//2], input_ids[-max_input_length//2:]), dim=-1)
+                self.input_ids.append(torch.concat((input_ids, output_ids), dim=-1))
+                self.labels.append(torch.concat((torch.full_like(input_ids, IGNORE_INDEX, dtype=torch.long), output_ids), dim=-1))
+        print('!' * 100, f"#Training samples = {len(self.input_ids)}")
 
     def __len__(self):
         return len(self.input_ids)
@@ -222,10 +177,22 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    wandb.login(key=os.environ.get('WANDB_API_KEY'))
+    if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+        wandb.init(
+            project="Long-Context-SFT",
+            name=training_args.run_name,
+            config={
+                'learning_rate': training_args.learning_rate,
+                'batch_size': training_args.per_device_train_batch_size * torch.cuda.device_count() * training_args.gradient_accumulation_steps
+            }
+        )
+
     if training_args.load_in_4bit:
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            torch_dtype=torch.bfloat16,
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
@@ -237,6 +204,7 @@ def train():
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            torch_dtype=torch.bfloat16,
             quantization_config=BitsAndBytesConfig(
                 load_in_8bit=True,
             )
@@ -245,6 +213,7 @@ def train():
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            torch_dtype=torch.bfloat16,
         )
     if training_args.enable_lora:
         lora_config = LoraConfig(
